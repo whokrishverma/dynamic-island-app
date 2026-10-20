@@ -7,7 +7,6 @@
 //
 
 import AppKit
-import Combine
 import SwiftUI
 
 enum MusicPlayer: Equatable {
@@ -51,11 +50,6 @@ final class NowPlayingModel: ObservableObject {
         if let progressTimer {
             RunLoop.main.add(progressTimer, forMode: .common)
         }
-    }
-
-    deinit {
-        observers.forEach { DistributedNotificationCenter.default().removeObserver($0) }
-        progressTimer?.invalidate()
     }
 
     func playPause() {
@@ -105,7 +99,7 @@ final class NowPlayingModel: ObservableObject {
         let playing = state.contains("play") && !state.contains("pause")
 
         var nextDuration = seconds(from: info["Duration"] ?? info["Total Time"] ?? info["TotalTime"])
-        var nextPosition = seconds(from: info["Playback Position"] ?? info["PlaybackPosition"])
+        let nextPosition = seconds(from: info["Playback Position"] ?? info["PlaybackPosition"])
 
         // Spotify duration in notifications is milliseconds; position is seconds.
         if player == .spotify, let raw = doubleValue(info["Duration"]), raw > 10_000 {
@@ -192,10 +186,8 @@ final class NowPlayingModel: ObservableObject {
 
     private func refreshFromRunningPlayers() {
         scriptQueue.async { [weak self] in
-            let spotify = Self.snapshotScript(player: .spotify)
-            let music = Self.snapshotScript(player: .music)
-            let spotifySnapshot = Self.parseSnapshot(Self.runString(spotify), player: .spotify)
-            let musicSnapshot = Self.parseSnapshot(Self.runString(music), player: .music)
+            let spotifySnapshot = PlayerAppleScript.snapshot(for: .spotify)
+            let musicSnapshot = PlayerAppleScript.snapshot(for: .music)
 
             DispatchQueue.main.async {
                 guard let self else { return }
@@ -217,7 +209,7 @@ final class NowPlayingModel: ObservableObject {
     private func refreshDetails(for player: MusicPlayer?) {
         guard let player else { return }
         scriptQueue.async { [weak self] in
-            let snapshot = Self.parseSnapshot(Self.runString(Self.snapshotScript(player: player)), player: player)
+            let snapshot = PlayerAppleScript.snapshot(for: player)
             DispatchQueue.main.async {
                 guard let self, let snapshot else { return }
                 if snapshot.stopped {
@@ -256,7 +248,7 @@ final class NowPlayingModel: ObservableObject {
         switch player {
         case .spotify:
             scriptQueue.async { [weak self] in
-                let urlString = Self.runString(Self.spotifyArtworkURLScript)?.trimmingCharacters(in: .whitespacesAndNewlines)
+                let urlString = PlayerAppleScript.spotifyArtworkURL()?.trimmingCharacters(in: .whitespacesAndNewlines)
                 DispatchQueue.main.async {
                     guard let self, self.artworkToken == token, let urlString, let url = URL(string: urlString) else { return }
                     self.fetchSpotifyArtwork(from: url, key: key)
@@ -264,7 +256,7 @@ final class NowPlayingModel: ObservableObject {
             }
         case .music:
             scriptQueue.async { [weak self] in
-                let image = Self.musicArtworkImage()
+                let image = PlayerAppleScript.musicArtworkImage()
                 DispatchQueue.main.async {
                     guard let self, self.artworkToken == token else { return }
                     self.artwork = image
@@ -297,26 +289,88 @@ final class NowPlayingModel: ObservableObject {
         end if
         """
         scriptQueue.async { [weak self] in
-            _ = Self.run(source)
+            _ = PlayerAppleScript.run(source)
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
                 self?.refreshDetails(for: player)
             }
         }
     }
 
-    // MARK: - Scripts
+    private func stringValue(_ value: Any?) -> String {
+        if let string = value as? String { return string }
+        if let value { return String(describing: value) }
+        return ""
+    }
 
-    private struct PlayerSnapshot {
-        var player: MusicPlayer
-        var title: String
-        var artist: String
-        var isPlaying: Bool
-        var position: TimeInterval
-        var duration: TimeInterval
-        var artworkURL: URL?
-        var stopped: Bool { title.isEmpty && artist.isEmpty }
+    private func doubleValue(_ value: Any?) -> Double? {
+        if let number = value as? NSNumber { return number.doubleValue }
+        if let double = value as? Double { return double }
+        if let int = value as? Int { return Double(int) }
+        if let string = value as? String { return Double(string) }
+        return nil
+    }
 
-        var artworkKey: String { "\(player)-\(title)-\(artist)" }
+    private func seconds(from value: Any?) -> TimeInterval? {
+        guard let raw = doubleValue(value) else { return nil }
+        return raw
+    }
+}
+
+private struct PlayerSnapshot {
+    var player: MusicPlayer
+    var title: String
+    var artist: String
+    var isPlaying: Bool
+    var position: TimeInterval
+    var duration: TimeInterval
+    var artworkURL: URL?
+    var stopped: Bool { title.isEmpty && artist.isEmpty }
+    var artworkKey: String { "\(player)-\(title)-\(artist)" }
+}
+
+private enum PlayerAppleScript {
+    static func snapshot(for player: MusicPlayer) -> PlayerSnapshot? {
+        parseSnapshot(runString(snapshotScript(player: player)), player: player)
+    }
+
+    static func spotifyArtworkURL() -> String? {
+        runString("""
+        if application "Spotify" is running then
+            tell application "Spotify"
+                if player state is stopped then return ""
+                return artwork url of current track
+            end tell
+        end if
+        return ""
+        """)
+    }
+
+    static func musicArtworkImage() -> NSImage? {
+        let source = """
+        if application "Music" is running then
+            tell application "Music"
+                try
+                    if player state is stopped then return
+                    if (count of artworks of current track) is 0 then return
+                    return raw data of artwork 1 of current track
+                end try
+            end tell
+        end if
+        """
+        guard let descriptor = run(source) else { return nil }
+        return image(from: descriptor)
+    }
+
+    @discardableResult
+    static func run(_ source: String) -> NSAppleEventDescriptor? {
+        var error: NSDictionary?
+        let result = NSAppleScript(source: source)?.executeAndReturnError(&error)
+        if error != nil { return nil }
+        return result
+    }
+
+    private static func runString(_ source: String) -> String? {
+        run(source)?.stringValue
     }
 
     private static func snapshotScript(player: MusicPlayer) -> String {
@@ -339,16 +393,6 @@ final class NowPlayingModel: ObservableObject {
         end if
         """
     }
-
-    private static let spotifyArtworkURLScript = """
-    if application "Spotify" is running then
-        tell application "Spotify"
-            if player state is stopped then return ""
-            return artwork url of current track
-        end tell
-    end if
-    return ""
-    """
 
     private static func parseSnapshot(_ raw: String?, player: MusicPlayer) -> PlayerSnapshot? {
         guard let raw else { return nil }
@@ -376,36 +420,9 @@ final class NowPlayingModel: ObservableObject {
         )
     }
 
-    private static func musicArtworkImage() -> NSImage? {
-        let source = """
-        if application "Music" is running then
-            tell application "Music"
-                try
-                    if player state is stopped then return
-                    if (count of artworks of current track) is 0 then return
-                    return raw data of artwork 1 of current track
-                end try
-            end tell
-        end if
-        """
-        guard let descriptor = run(source) else { return nil }
-        return image(from: descriptor)
-    }
-
-    @discardableResult
-    private static func run(_ source: String) -> NSAppleEventDescriptor? {
-        var error: NSDictionary?
-        let result = NSAppleScript(source: source)?.executeAndReturnError(&error)
-        if error != nil { return nil }
-        return result
-    }
-
-    private static func runString(_ source: String) -> String? {
-        run(source)?.stringValue
-    }
-
     private static func image(from descriptor: NSAppleEventDescriptor) -> NSImage? {
-        if let data = descriptor.data, let image = NSImage(data: data) {
+        let data = descriptor.data
+        if !data.isEmpty, let image = NSImage(data: data) {
             return image
         }
         if descriptor.numberOfItems > 0 {
@@ -416,24 +433,5 @@ final class NowPlayingModel: ObservableObject {
             }
         }
         return nil
-    }
-
-    private func stringValue(_ value: Any?) -> String {
-        if let string = value as? String { return string }
-        if let value { return String(describing: value) }
-        return ""
-    }
-
-    private func doubleValue(_ value: Any?) -> Double? {
-        if let number = value as? NSNumber { return number.doubleValue }
-        if let double = value as? Double { return double }
-        if let int = value as? Int { return Double(int) }
-        if let string = value as? String { return Double(string) }
-        return nil
-    }
-
-    private func seconds(from value: Any?) -> TimeInterval? {
-        guard let raw = doubleValue(value) else { return nil }
-        return raw
     }
 }

@@ -18,6 +18,7 @@ struct NotchLyricsApp: App {
     }
 }
 
+@MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private let nowPlaying = NowPlayingModel()
     private var notchPanelController: NotchPanelController?
