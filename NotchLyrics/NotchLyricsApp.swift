@@ -9,9 +9,30 @@ import SwiftUI
 
 @main
 struct NotchLyricsApp: App {
+    @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
+
     var body: some Scene {
-        WindowGroup {
-            ContentView()
+        Settings {
+            EmptyView()
         }
+    }
+}
+
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    private let nowPlaying = NowPlayingModel()
+    private var notchPanelController: NotchPanelController?
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        NSApp.setActivationPolicy(.accessory)
+
+        nowPlaying.start()
+
+        let controller = NotchPanelController(model: nowPlaying)
+        controller.show()
+        notchPanelController = controller
+    }
+
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        false
     }
 }
